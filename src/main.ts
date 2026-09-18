@@ -1,60 +1,83 @@
-import './style.css'
-import heroImg from './assets/hero.png'
-import typescriptLogo from './assets/typescript.svg'
-import viteLogo from './assets/vite.svg'
-import { setupCounter } from './counter.ts'
+// src/main.ts
+// M0：抓一小塊維港的 OSM 資料 → 產生地形網格 → 畫出來用眼睛檢查。
 
-document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
-<section id="center">
-  <div class="hero">
-    <img src="${heroImg}" class="base" width="170" height="179">
-    <img src="${typescriptLogo}" class="framework" alt="TypeScript logo"/>
-    <img src="${viteLogo}" class="vite" alt="Vite logo" />
-  </div>
-  <div>
-    <h1>Get started</h1>
-    <p>Edit <code>src/main.ts</code> and save to test <code>HMR</code></p>
-  </div>
-  <button id="counter" type="button" class="counter"></button>
-</section>
+import { fetchOsm, classify, type Feature } from './mapgen/overpass';
+import { rasterize } from './mapgen/rasterize';
+import { PALETTE, TERRAIN_NAMES, rgbToCss, type BBox, type TerrainGrid } from './mapgen/types';
 
-<div class="ticks"></div>
+// 尖沙咀至灣仔一帶，約 5 公里 × 3.3 公里
+const BBOX: BBox = { west: 114.155, south: 22.278, east: 114.208, north: 22.31 };
+const CELL_PX = 3; // 每格畫幾個螢幕像素
 
-<section id="next-steps">
-  <div id="docs">
-    <svg class="icon" role="presentation" aria-hidden="true"><use href="/icons.svg#documentation-icon"></use></svg>
-    <h2>Documentation</h2>
-    <p>Your questions, answered</p>
-    <ul>
-      <li>
-        <a href="https://vite.dev/" target="_blank">
-          <img class="logo" src="${viteLogo}" alt="" />
-          Explore Vite
-        </a>
-      </li>
-      <li>
-        <a href="https://www.typescriptlang.org" target="_blank">
-          <img class="button-icon" src="${typescriptLogo}" alt="">
-          Learn more
-        </a>
-      </li>
-    </ul>
-  </div>
-  <div id="social">
-    <svg class="icon" role="presentation" aria-hidden="true"><use href="/icons.svg#social-icon"></use></svg>
-    <h2>Connect with us</h2>
-    <p>Join the Vite community</p>
-    <ul>
-      <li><a href="https://github.com/vitejs/vite" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#github-icon"></use></svg>GitHub</a></li>
-      <li><a href="https://chat.vite.dev/" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#discord-icon"></use></svg>Discord</a></li>
-      <li><a href="https://x.com/vite_js" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#x-icon"></use></svg>X.com</a></li>
-      <li><a href="https://bsky.app/profile/vite.dev" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#bluesky-icon"></use></svg>Bluesky</a></li>
-    </ul>
-  </div>
-</section>
+const app = document.querySelector<HTMLDivElement>('#app')!;
+app.innerHTML = `
+  <p id="status">準備中…</p>
+  <canvas id="grid"></canvas>
+  <p id="stats"></p>
+  <button id="save" disabled>下載地形檔</button>
+`;
 
-<div class="ticks"></div>
-<section id="spacer"></section>
-`
+const statusEl = app.querySelector<HTMLParagraphElement>('#status')!;
+const statsEl = app.querySelector<HTMLParagraphElement>('#stats')!;
+const canvas = app.querySelector<HTMLCanvasElement>('#grid')!;
+const saveBtn = app.querySelector<HTMLButtonElement>('#save')!;
 
-setupCounter(document.querySelector<HTMLButtonElement>('#counter')!)
+function drawGrid(grid: TerrainGrid) {
+  canvas.width = grid.width * CELL_PX;
+  canvas.height = grid.height * CELL_PX;
+  const ctx = canvas.getContext('2d')!;
+  for (let y = 0; y < grid.height; y++) {
+    for (let x = 0; x < grid.width; x++) {
+      ctx.fillStyle = rgbToCss(PALETTE[grid.cells[y * grid.width + x]]);
+      ctx.fillRect(x * CELL_PX, y * CELL_PX, CELL_PX, CELL_PX);
+    }
+  }
+}
+
+function describe(grid: TerrainGrid, features: Feature[], tunnels: unknown[]): string {
+  const counts = new Map<number, number>();
+  for (const c of grid.cells) counts.set(c, (counts.get(c) ?? 0) + 1);
+  const total = grid.cells.length;
+  const parts = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([code, n]) => `${TERRAIN_NAMES[code]} ${((n / total) * 100).toFixed(1)}%`);
+  const metresPerCell =
+    ((BBOX.east - BBOX.west) * 111320 * Math.cos((BBOX.south * Math.PI) / 180)) / grid.width;
+  return [
+    `網格 ${grid.width}×${grid.height}，每格約 ${metresPerCell.toFixed(1)} 米`,
+    `圖徵 ${features.length} 條，隧道 ${tunnels.length} 條`,
+    parts.join('、'),
+  ].join(' ｜ ');
+}
+
+async function run() {
+  try {
+    statusEl.textContent = '正在向 Overpass 取得資料…（首次可能要等十幾秒）';
+    const ways = await fetchOsm(BBOX);
+
+    statusEl.textContent = `取得 ${ways.length} 條資料，正在產生地形…`;
+    const features = ways.map(classify).filter((f): f is Feature => f !== null);
+    const { grid, tunnels } = rasterize(features, BBOX, 256);
+
+    drawGrid(grid);
+    statusEl.textContent = '完成。請檢查：海底隧道有沒有變成海上陸橋、碼頭有沒有斷開。';
+    statsEl.textContent = describe(grid, features, tunnels);
+
+    saveBtn.disabled = false;
+    saveBtn.onclick = () => {
+      const blob = new Blob(
+        [JSON.stringify({ schemaVersion: 1, ...grid, cells: Array.from(grid.cells) })],
+        { type: 'application/json' },
+      );
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'victoria-harbour.json';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    };
+  } catch (err) {
+    statusEl.textContent = `出錯了：${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+run();
